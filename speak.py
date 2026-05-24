@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ubuntu-native speech helper for Alyx.
+"""Ubuntu-native speech helper for Agent.
 
 Goal: text -> local TTS backend -> WAV -> speakers.
 
@@ -7,8 +7,8 @@ Piper remains the reliable fallback. Kokoro is available as an optional
 Ubuntu-local backend when its isolated environment exists under ~/.openclaw.
 
 Usage:
-  python3 voice/speak.py "Alyx voice test."
-  echo "Alyx voice test." | python3 voice/speak.py
+  python3 voice/speak.py "Agent voice test."
+  echo "Agent voice test." | python3 voice/speak.py
   python3 voice/speak.py --wav-out voice/tmp/test.wav "Save this as a wav."
   python3 voice/speak.py --backend kokoro --voice af_heart "Kokoro voice test."
 """
