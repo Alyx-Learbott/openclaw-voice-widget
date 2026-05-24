@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Alyx local voice control widget — GTK4/Adwaita desktop controller.
+"""Agent local voice control widget — GTK4/Adwaita desktop controller.
 
 Five actions:
-  1. Press to Talk (speech reply) — hold to record, release to send, Alyx speaks reply
+  1. Press to Talk (speech reply) — hold to record, release to send, Agent speaks reply
   2. Press to Talk (GUI reply) — hold to record, release to send, text-only reply
   3. Conversation mode — continuous listen/speak loop with auto-stop on 1 silent turn
   4. TTS warm toggle — pre-load Kokoro model for faster first reply
@@ -55,7 +55,7 @@ SYSTEM_PYTHON = Path(sys.executable)
 # Use venv Python for voice tools (faster_whisper, presence, etc)
 PYTHON = str(VENV_PYTHON) if VENV_PYTHON.exists() else str(SYSTEM_PYTHON)
 
-APP_ID = "ai.openclaw.alyx-voice"
+APP_ID = "ai.openclaw.agent-voice"
 LOCK_FILE = Path(f"/tmp/{APP_ID}.lock")
 
 # ── Tunable settings ──────────────────────────────────────
@@ -679,7 +679,7 @@ PTT silence timeout: only applies if PTT stop on silence is enabled."""
         if marker not in stdout:
             return ""
         after_marker = stdout.split(marker, 1)[1]
-        before_reply = after_marker.split("\nAlyx:", 1)[0]
+        before_reply = after_marker.split("\nAgent:", 1)[0]
         return before_reply.strip()
 
     def _is_meaningful_transcript(self, transcript: str) -> bool:
@@ -910,7 +910,7 @@ def main():
     try:
         fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except IOError:
-        print("Another instance of Alyx Voice is running. Attempting to replace...", file=sys.stderr)
+        print("Another instance of Agent Voice is running. Attempting to replace...", file=sys.stderr)
         try:
             # Kill by process name to ensure we clear the zombie/frozen GUI
             subprocess.run(["pkill", "-f", "python3 .*voice/widget.py"], check=False)
