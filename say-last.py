@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Speak the latest Alyx assistant reply from an OpenClaw session.
+"""Speak the latest Agent assistant reply from an OpenClaw session.
 
 Ubuntu-first helper: OpenClaw chat.history -> voice/speak.py -> local TTS -> speakers.
 Piper remains the default fallback; Kokoro can be selected with --backend kokoro.
@@ -140,7 +140,7 @@ def speak_text(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Speak the latest Alyx assistant reply")
+    parser = argparse.ArgumentParser(description="Speak the latest Agent assistant reply")
     parser.add_argument("--session-key", default=DEFAULT_SESSION_KEY)
     parser.add_argument("--limit", type=int, default=120)
     parser.add_argument("--backend", choices=["piper", "kokoro"], default="piper", help="TTS backend to use")
