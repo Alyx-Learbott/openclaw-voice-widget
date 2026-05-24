@@ -1,11 +1,11 @@
-# Alyx Voice Improvement Plan
+# Agent Voice Improvement Plan
 
 Date: 2026-05-10
 Status: research + planning complete; implementation not started
 
 ## Goal
 
-Make Alyx's local voice smoother, warmer, and more emotionally expressive while keeping the current Piper path as the reliable fallback.
+Make Agent's local voice smoother, warmer, and more emotionally expressive while keeping the current Piper path as the reliable fallback.
 
 ## Current baseline
 
@@ -38,7 +38,7 @@ Caveat: likely more natural than Piper, but not deeply emotion-controllable. Goo
 
 Zonos is open-weight and supports voice cloning/reference audio plus fine-grained conditioning: speaking rate, pitch variation, audio quality, and emotion vectors such as happiness, fear, sadness, anger, neutral, etc. It outputs at 44 kHz and has a Gradio/demo path.
 
-Caveats: intended for GPU; CPU can run but is likely too slow for interactive use. Hybrid model has stricter GPU requirements; transformer may be more feasible. This is the most interesting candidate for an expressive Alyx identity, but probably not first implementation.
+Caveats: intended for GPU; CPU can run but is likely too slow for interactive use. Hybrid model has stricter GPU requirements; transformer may be more feasible. This is the most interesting candidate for an expressive Agent identity, but probably not first implementation.
 
 ### F5-TTS: strong voice-cloning/quality candidate
 
@@ -52,7 +52,7 @@ Orpheus is a 3B LLM-backed TTS system with natural rhythm, zero-shot cloning, st
 
 Caveats: heavy for this SER9 setup, more moving parts, likely not the first local experiment unless we specifically want to evaluate tag-driven emotion.
 
-### Dia: great for dialogue/nonverbals, not ideal as Alyx's default voice
+### Dia: great for dialogue/nonverbals, not ideal as Agent's default voice
 
 Dia generates realistic dialogue, supports audio conditioning and tags like `(laughs)`, `(sighs)`, `(clears throat)`, etc. Good for storytime/dialogue experiments.
 
@@ -110,7 +110,7 @@ Expected result: smoother and more natural than Piper if setup is clean.
 
 ### Phase 4 — Evaluate expressive engines offline
 
-Purpose: find the eventual emotive Alyx voice.
+Purpose: find the eventual emotive Agent voice.
 
 Priority order:
 
