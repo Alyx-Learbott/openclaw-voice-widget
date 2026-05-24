@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+"""Ubuntu-native speech helper for Alyx.
+
+Goal: text -> local TTS backend -> WAV -> speakers.
+
+Piper remains the reliable fallback. Kokoro is available as an optional
+Ubuntu-local backend when its isolated environment exists under ~/.openclaw.
+
+Usage:
+  python3 voice/speak.py "Alyx voice test."
+  echo "Alyx voice test." | python3 voice/speak.py
+  python3 voice/speak.py --wav-out voice/tmp/test.wav "Save this as a wav."
+  python3 voice/speak.py --backend kokoro --voice af_heart "Kokoro voice test."
+"""
+from __future__ import annotations
+
+import argparse
+import shutil
+import subprocess
+import sys
+import tempfile
+import wave
+from pathlib import Path
+
+from presence import can_speak, speaking_guard
+
+ROOT = Path(__file__).resolve().parent
+WORKSPACE = ROOT.parent
+DEFAULT_MODEL = ROOT / "models" / "piper" / "en_US-lessac-medium.onnx"
+DEFAULT_TMP = ROOT / "tmp"
+DEFAULT_BACKEND = "piper"
+DEFAULT_KOKORO_VOICE = "af_heart"
+DEFAULT_KOKORO_PYTHON = Path.home() / ".openclaw" / "tts" / "kokoro" / ".venv312" / "bin" / "python"
+
+
+TTS_DAEMON_SOCKET = ROOT / "tmp" / "tts-daemon.sock"
+
+
+def try_daemon_synthesize(text: str, wav_path: Path, voice: str = DEFAULT_KOKORO_VOICE, speed: float = 1.0, backend: str = "kokoro") -> bool:
+    """Try to synthesize via the TTS daemon. Returns True if successful."""
+    import json as _json
+    import socket as _socket
+
+    if not TTS_DAEMON_SOCKET.exists():
+        return False
+
+    try:
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        sock.settimeout(30.0)
+        sock.connect(str(TTS_DAEMON_SOCKET))
+        request = {
+            "action": "synthesize",
+            "text": text,
+            "voice": voice,
+            "speed": speed,
+            "wav_out": str(wav_path),
+            "backend": backend,
+        }
+        sock.sendall((_json.dumps(request) + "\n").encode("utf-8"))
+        response_data = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            response_data += chunk
+            if b"\n" in response_data:
+                break
+        sock.close()
+        response = _json.loads(response_data.decode("utf-8").strip())
+        return response.get("status") == "ok"
+    except Exception:
+        return False
+
+
+def read_text(args_text: list[str]) -> str:
+    if args_text:
+        return " ".join(args_text).strip()
+    if not sys.stdin.isatty():
+        return sys.stdin.read().strip()
+    return ""
+
+
+
+
+def clean_text_for_speech(text: str) -> str:
+    import re
+    import unicodedata
+
+    def friendly_file_reference(match: re.Match) -> str:
+        """Turn path-like text into something less awful to hear aloud.
+
+        The exact path still remains in chat; this only affects spoken output.
+        Example: voice/backups/speak.py.20260513-190059.bak
+        -> "speak Python backup file".
+        """
+        raw = match.group(0).strip().rstrip(".,;:)]}")
+        basename = raw.rstrip("/").split("/")[-1]
+        if not basename:
+            return "file"
+
+        parts = [part for part in basename.split(".") if part]
+        if not parts:
+            return "file"
+
+        stem = parts[0]
+        suffixes = parts[1:]
+
+        # Drop timestamp/hash-ish chunks that are useful visually but noisy aloud.
+        suffixes = [
+            part for part in suffixes
+            if not re.fullmatch(r"\d{6,}(?:[-_]\d{4,})?", part)
+            and not re.fullmatch(r"[a-fA-F0-9]{10,}", part)
+        ]
+
+        stem_words = re.sub(r"[-_]+", " ", stem).strip() or "file"
+        ext_words = {
+            "py": "Python",
+            "json": "JSON",
+            "md": "Markdown",
+            "txt": "text",
+            "wav": "wave audio",
+            "raw": "raw audio",
+            "desktop": "desktop launcher",
+            "bak": "backup",
+            "onnx": "ONNX model",
+            "odt": "document",
+        }
+
+        spoken_suffixes: list[str] = []
+        for suffix in suffixes:
+            word = ext_words.get(suffix.lower())
+            if word and word not in spoken_suffixes:
+                spoken_suffixes.append(word)
+
+        if spoken_suffixes:
+            return f"{stem_words} {' '.join(spoken_suffixes)} file"
+        return f"{stem_words} file"
+
+    speech = text.strip()
+    if not speech:
+        return ""
+
+    # Remove fenced code blocks entirely; they are rarely useful spoken aloud.
+    speech = re.sub(r"```.*?```", " ", speech, flags=re.S)
+    speech = re.sub(r"`([^`]+)`", r"\1", speech)
+    speech = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", speech)
+    speech = re.sub(r"https?://\S+", "", speech)
+    known_file_exts = r"py|json|md|txt|wav|raw|desktop|bak|onnx|odt"
+    speech = re.sub(
+        # Absolute/home/dot paths, relative paths that end in a known filename,
+        # or standalone known filenames. Avoid casual slash phrases like
+        # "dramatic/technical".
+        rf"(?<!\w)(?:~|\.|\.\.)?/[\w./~+@-]+|(?<!\w)(?:[\w.-]+/)+[\w.-]+\.(?:{known_file_exts})(?:\.[\w.-]+)*|\b[\w.-]+\.(?:{known_file_exts})(?:\.[\w.-]+)*\b",
+        friendly_file_reference,
+        speech,
+    )
+    speech = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", speech)
+    # Preserve list boundaries for TTS. Stripping bullets and then collapsing
+    # whitespace makes Kokoro read separate bullets like one run-on sentence.
+    # Convert common Markdown bullets/numbered lists into newline pause points.
+    speech = re.sub(r"(?m)^\s*[-*+]\s+", "\n", speech)
+    speech = re.sub(r"(?m)^\s*\d+[.)]\s+", "\n", speech)
+    speech = re.sub(r"(?m)^\s*>\s*", "", speech)
+    speech = speech.replace("**", "")
+    speech = speech.replace("__", "")
+    speech = speech.replace("*", "")
+    speech = speech.replace("_", " ")
+
+    cleaned_chars: list[str] = []
+    for char in speech:
+        category = unicodedata.category(char)
+        if category in {"So", "Sk", "Cs"}:
+            continue
+        cleaned_chars.append(char)
+    speech = "".join(cleaned_chars)
+    speech = speech.replace("&", " and ")
+    speech = re.sub(r"\s*(?:→|⇒|➜|->|=>)\s*", " to ", speech)
+    speech = speech.replace("—", ", ")
+    speech = speech.replace("–", ", ")
+    # Keep paragraph/list newlines as pause boundaries while normalizing spaces
+    # inside each spoken line.
+    speech = re.sub(r"[ \t\r\f\v]+", " ", speech)
+    speech = re.sub(r" *\n+ *", "\n", speech)
+    speech = re.sub(r"\n{3,}", "\n\n", speech)
+    return speech.strip()
+
+def load_piper_voice(model_path: Path):
+    try:
+        from piper import PiperVoice
+    except Exception as exc:  # pragma: no cover - depends on local env
+        raise RuntimeError(
+            "Python package 'piper' is not available. Install Piper/Piper TTS in the voice environment first."
+        ) from exc
+    return PiperVoice.load(str(model_path))
+
+
+def synthesize_piper_to_wav(text: str, model_path: Path, wav_path: Path) -> None:
+    if not model_path.exists():
+        raise FileNotFoundError(f"Piper model not found: {model_path}")
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+    voice = load_piper_voice(model_path)
+    with wave.open(str(wav_path), "wb") as wav_file:
+        voice.synthesize_wav(text, wav_file)
+
+
+def synthesize_kokoro_to_wav(
+    text: str,
+    wav_path: Path,
+    voice: str = DEFAULT_KOKORO_VOICE,
+    speed: float = 1.0,
+    python_path: Path = DEFAULT_KOKORO_PYTHON,
+) -> None:
+    """Synthesize speech with the local Kokoro environment.
+
+    Kokoro intentionally lives outside the shared NTFS workspace because its
+    Python/PyTorch environment is platform-specific and native-package heavy.
+    This wrapper keeps the public CLI stable while delegating Kokoro synthesis
+    to the local Ubuntu venv.
+    """
+    if not python_path.exists():
+        raise FileNotFoundError(
+            f"Kokoro Python not found: {python_path}. Set up Kokoro locally or use --backend piper."
+        )
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+    script = r'''
+import sys
+from pathlib import Path
+import numpy as np
+import soundfile as sf
+from kokoro import KPipeline
+
+voice = sys.argv[1]
+wav_path = Path(sys.argv[2])
+speed = float(sys.argv[3])
+text = sys.stdin.read().strip()
+if not text:
+    raise SystemExit("No text provided to Kokoro")
+
+pipeline = KPipeline(lang_code='a')
+chunks = list(pipeline(text, voice=voice, speed=speed, split_pattern=r'\n+'))
+audio_parts = [chunk[2] for chunk in chunks]
+audio = audio_parts[0] if len(audio_parts) == 1 else np.concatenate(audio_parts)
+sf.write(wav_path, audio, 24000)
+'''
+    result = subprocess.run(
+        [str(python_path), "-c", script, voice, str(wav_path), str(speed)],
+        input=text,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        cwd=str(WORKSPACE),
+    )
+    if result.returncode != 0:
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+        raise RuntimeError(output or f"Kokoro synthesis failed with exit code {result.returncode}")
+
+
+def synthesize_to_wav(
+    text: str,
+    wav_path: Path,
+    backend: str,
+    model_path: Path,
+    kokoro_voice: str,
+    kokoro_speed: float,
+    kokoro_python: Path,
+) -> None:
+    # Try daemon first for faster synthesis
+    if backend in ("kokoro", "piper"):
+        if try_daemon_synthesize(text, wav_path, voice=kokoro_voice, speed=kokoro_speed, backend=backend):
+            return
+
+    # Fall back to in-process synthesis
+    if backend == "piper":
+        synthesize_piper_to_wav(text, model_path, wav_path)
+        return
+    if backend == "kokoro":
+        synthesize_kokoro_to_wav(
+            text,
+            wav_path,
+            voice=kokoro_voice,
+            speed=kokoro_speed,
+            python_path=kokoro_python,
+        )
+        return
+    raise ValueError(f"Unsupported TTS backend: {backend}")
+
+
+def wav_duration_seconds(wav_path: Path) -> float:
+    with wave.open(str(wav_path), "rb") as wav_file:
+        frames = wav_file.getnframes()
+        rate = wav_file.getframerate() or 1
+    return frames / float(rate)
+
+
+def wav_frame_count(wav_path: Path) -> int:
+    with wave.open(str(wav_path), "rb") as wav_file:
+        return wav_file.getnframes()
+
+
+def play_wav(wav_path: Path) -> None:
+    """Play a WAV file through the best available audio backend.
+
+    On Kevin's SER9, PipeWire (pw-play) connects streams but never actually
+    routes audio to the hardware sink — streams get stuck in "paused" state.
+    Direct ALSA (aplay -D plughw:...) works reliably. We try ALSA direct
+    first, then fall back to PipeWire/Pulse for other environments.
+    """
+    duration = wav_duration_seconds(wav_path)
+    timeout = max(2.5, min(90.0, duration + 1.5))
+
+    # Detect the default ALSA playback card for direct hardware output.
+    # On this system: card 3 (Generic_1 / CX20632 Analog) is the speaker output.
+    alsa_card = _detect_alsa_playback_card()
+
+    players: list[list[str]] = []
+    if alsa_card:
+        # Direct ALSA is most reliable on this hardware.
+        players.append(["aplay", "-D", f"plughw:CARD={alsa_card},DEV=0", "-q", str(wav_path)])
+    # PipeWire / PulseAudio as fallbacks for other environments.
+    players.append(["pw-play", str(wav_path)])
+    players.append(["paplay", str(wav_path)])
+    players.append(["aplay", "-q", str(wav_path)])
+
+    errors: list[str] = []
+    for cmd in players:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            subprocess.run(cmd, check=True, timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            # pw-play/aplay can hang after playback completes.
+            # If audio actually played (we heard it), this is fine.
+            return
+        except subprocess.CalledProcessError as exc:
+            errors.append(f"{cmd[0]} exited {exc.returncode}")
+    if errors:
+        raise RuntimeError("Audio playback failed: " + "; ".join(errors))
+    raise RuntimeError("No supported audio player found. Tried: aplay, pw-play, paplay")
+
+
+def _detect_alsa_playback_card() -> str | None:
+    """Detect the ALSA card name for the default PipeWire sink.
+
+    Returns the ALSA card name (e.g. 'Generic_1') or None if detection fails.
+    """
+    try:
+        result = subprocess.run(
+            ["wpctl", "inspect", "@DEFAULT_SINK@"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("alsa.card_name"):
+            # e.g. alsa.card_name = "HD-Audio Generic"
+            # We need the ALSA card identifier, not the display name.
+            pass
+        if line.startswith("api.alsa.pcm.card"):
+            # e.g. api.alsa.pcm.card = "3"
+            card_num = line.split("=", 1)[1].strip().strip('"')
+            # Now look up the card name from aplay -l
+            aplay_result = subprocess.run(
+                ["aplay", "-l"], capture_output=True, text=True, timeout=5,
+            )
+            for aplay_line in aplay_result.stdout.splitlines():
+                if f"card {card_num}:" in aplay_line:
+                    # e.g. "card 3: Generic_1 [HD-Audio Generic]"
+                    # Extract the short name after "card N: "
+                    match_line = aplay_line.split(":", 1)[1].strip()
+                    # e.g. "Generic_1 [HD-Audio Generic]"
+                    card_name = match_line.split("[")[0].strip()
+                    return card_name
+    return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Speak text locally with Piper or Kokoro on Ubuntu")
+    parser.add_argument("text", nargs="*", help="Text to speak. If omitted, stdin is used.")
+    parser.add_argument("--backend", choices=["piper", "kokoro"], default=DEFAULT_BACKEND, help="TTS backend to use")
+    parser.add_argument("--model", default=str(DEFAULT_MODEL), help="Path to Piper .onnx model")
+    parser.add_argument("--voice", default=DEFAULT_KOKORO_VOICE, help="Kokoro voice name, e.g. af_heart")
+    parser.add_argument("--speed", type=float, default=1.0, help="Kokoro speaking speed")
+    parser.add_argument("--kokoro-python", default=str(DEFAULT_KOKORO_PYTHON), help="Path to Kokoro venv Python")
+    parser.add_argument("--wav-out", help="Write WAV to this path instead of a temp file")
+    parser.add_argument("--no-play", action="store_true", help="Synthesize only; do not play audio")
+    parser.add_argument("--raw", action="store_true", help="Do not clean Markdown/directives before speaking")
+    parser.add_argument("--ignore-presence", action="store_true", help="Play even if presence state says speech is disabled")
+    parser.add_argument("--warm-only", action="store_true", help="Pre-load TTS model without speaking; exits after model is loaded")
+    args = parser.parse_args()
+
+    text = read_text(args.text)
+    if not args.raw and text:
+        text = clean_text_for_speech(text)
+
+    # Warm-only mode: load the model, synthesize a short phrase, discard output, exit.
+    if args.warm_only:
+        warm_text = text or "ready"
+        warm_tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=True, dir=str(DEFAULT_TMP))
+        warm_tmp.close()
+        warm_path = Path(warm_tmp.name)
+        DEFAULT_TMP.mkdir(parents=True, exist_ok=True)
+        try:
+            synthesize_to_wav(
+                warm_text,
+                warm_path,
+                backend=args.backend,
+                model_path=Path(args.model).expanduser() if Path(args.model).expanduser().is_absolute() else WORKSPACE / args.model,
+                kokoro_voice=args.voice,
+                kokoro_speed=args.speed,
+                kokoro_python=Path(args.kokoro_python).expanduser() if Path(args.kokoro_python).expanduser().is_absolute() else WORKSPACE / args.kokoro_python,
+            )
+            print(f"TTS model warmed: {args.backend}", file=sys.stderr)
+            return 0
+        except Exception as exc:
+            print(f"TTS warm-up failed: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            try:
+                warm_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    if not text:
+        print("No text provided. Pass text as arguments or stdin.", file=sys.stderr)
+        return 2
+
+    model_path = Path(args.model).expanduser()
+    if not model_path.is_absolute():
+        model_path = WORKSPACE / model_path
+
+    if args.wav_out:
+        wav_path = Path(args.wav_out).expanduser()
+        if not wav_path.is_absolute():
+            wav_path = WORKSPACE / wav_path
+        cleanup = False
+    else:
+        DEFAULT_TMP.mkdir(parents=True, exist_ok=True)
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=str(DEFAULT_TMP))
+        tmp.close()
+        wav_path = Path(tmp.name)
+        cleanup = True
+
+    kokoro_python = Path(args.kokoro_python).expanduser()
+    if not kokoro_python.is_absolute():
+        kokoro_python = WORKSPACE / kokoro_python
+
+    if not args.no_play and not args.ignore_presence:
+        allowed, reason = can_speak()
+        if not allowed:
+            print(f"Speech blocked by presence state: {reason}", file=sys.stderr)
+            return 3
+
+    try:
+        synthesize_to_wav(
+            text,
+            wav_path,
+            backend=args.backend,
+            model_path=model_path,
+            kokoro_voice=args.voice,
+            kokoro_speed=args.speed,
+            kokoro_python=kokoro_python,
+        )
+        if not args.no_play:
+            with speaking_guard(enabled=not args.ignore_presence):
+                play_wav(wav_path)
+        if args.wav_out or args.no_play:
+            print(str(wav_path))
+        return 0
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if cleanup:
+            try:
+                wav_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

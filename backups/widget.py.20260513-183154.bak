@@ -1,0 +1,587 @@
+#!/usr/bin/env python3
+"""Alyx local voice control widget — GTK4/Adwaita desktop controller.
+
+Five actions:
+  1. Press to Talk (speech reply) — hold to record, release to send, Alyx speaks reply
+  2. Press to Talk (GUI reply) — hold to record, release to send, text-only reply
+  3. Conversation mode — continuous listen/speak loop with auto-stop on 1 silent turn
+  4. TTS warm toggle — pre-load Kokoro model for faster first reply
+  5. Privacy kill switch — stops all recording, mutes mic
+
+Architecture:
+  - Widget is a thin controller over voice/presence.py and voice/converse.py.
+  - PTT records via listen.py, then hands WAV to converse.py --wav-in.
+  - Conversation mode runs converse.py --stop-on-silence in a loop, stopping after
+    1 consecutive empty/silent turn.
+  - TTS warm runs speak.py --warm-only to load the Kokoro model.
+  - Status sync via voice/presence-state.json polling.
+  - Visual: green = recording/conversation, red = privacy, neutral = idle.
+
+Requirements:
+  - Python 3.10+
+  - PyGObject (gi) with GTK 4 and libadwaita
+  - All existing voice/ dependencies
+
+Run:
+  cd /shared/openclaw_shared/workspace
+  . .venv-voice/bin/activate
+  python voice/widget.py
+"""
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, GLib, Gtk
+
+VOICE_DIR = Path(__file__).resolve().parent
+WORKSPACE = VOICE_DIR.parent
+STATE_PATH = VOICE_DIR / "presence-state.json"
+VENV_PYTHON = WORKSPACE / ".venv-voice" / "bin" / "python3"
+SYSTEM_PYTHON = Path(sys.executable)
+
+# Use venv Python for voice tools (faster_whisper, presence, etc)
+PYTHON = str(VENV_PYTHON) if VENV_PYTHON.exists() else str(SYSTEM_PYTHON)
+
+APP_ID = "ai.openclaw.alyx-voice"
+
+# ── Tunable settings ──────────────────────────────────────
+# Change these to adjust behavior without hunting through code.
+# Widget must be restarted for changes to take effect.
+CONV_SILENCE_SECONDS = 2.5      # Silence timeout for conversation mode
+CONV_MAX_DURATION = 180         # Max recording duration for conversation mode (seconds)
+PTT_SILENCE_SECONDS = 4.0      # Silence timeout for push-to-talk
+PTT_MAX_DURATION = 30            # Max recording duration for push-to-talk (seconds)
+WHISPER_MODEL = "small.en"      # faster-whisper model for transcription
+TTS_BACKEND = "kokoro"         # Default TTS backend
+TTS_VOICE = "af_heart"          # Default Kokoro voice
+TTS_SPEED = 1.0                 # Default Kokoro speed
+IDLE_TIMEOUT_S = 300           # TTS daemon idle shutdown timeout (seconds)
+CONV_IDLE_TIMEOUT_S = 180      # Conversation loop idle timeout: stop after 3 min with no speech
+
+# Colors for status indication
+COLOR_IDLE = "#888888"
+COLOR_RECORDING = "#4CAF50"    # Green
+COLOR_THINKING = "#FF9800"     # Orange
+COLOR_SPEAKING = "#2196F3"     # Blue
+COLOR_PRIVACY = "#F44336"      # Red
+COLOR_WARMING = "#9C27B0"      # Purple
+
+
+class VoiceWidget(Gtk.ApplicationWindow):
+    """Main voice control window."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs, title="Alyx Voice")
+
+        self._recording_proc = None
+        self._converse_proc = None
+        self._converse_thread = None
+        self._ptt_wav_path = None
+        self._ptt_speech_reply = True
+        self._tts_warmed = False
+        self._conv_active = False
+        self._poll_source_id = None
+
+        self.set_default_size(320, 400)
+        self.set_resizable(False)
+
+        self._build_ui()
+        self._start_polling()
+
+    # ── UI construction ──────────────────────────────────────
+
+    def _build_ui(self):
+        main_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=16,
+            margin_bottom=16,
+            margin_start=16,
+            margin_end=16,
+        )
+        self.set_child(main_box)
+
+        # Title + status
+        title_label = Gtk.Label(label="Alyx Voice Control")
+        title_label.add_css_class("title-4")
+        main_box.append(title_label)
+
+        self._status_label = Gtk.Label(label="Idle")
+        self._status_label.add_css_class("heading")
+        main_box.append(self._status_label)
+
+        # Status indicator (colored box)
+        self._status_box = Gtk.Box()
+        self._status_box.set_size_request(-1, 6)
+        self._status_box.add_css_class("status-indicator")
+        self._set_indicator_color(COLOR_IDLE)
+        main_box.append(self._status_box)
+
+        # ── Push to Talk section ──
+        ptt_frame = Gtk.Frame(label="Push to Talk")
+        ptt_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                           margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
+        ptt_frame.set_child(ptt_box)
+        main_box.append(ptt_frame)
+
+        self._ptt_speech_btn = Gtk.Button(label="🎙️ Press & Hold (speech reply)")
+        self._ptt_speech_btn.add_css_class("suggested-action")
+        ptt_box.append(self._ptt_speech_btn)
+
+        self._ptt_gui_btn = Gtk.Button(label="⌨️ Press & Hold (GUI reply)")
+        ptt_box.append(self._ptt_gui_btn)
+
+        # ── Conversation mode ──
+        conv_frame = Gtk.Frame(label="Conversation")
+        conv_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                           margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
+        conv_frame.set_child(conv_box)
+        main_box.append(conv_frame)
+
+        self._conv_btn = Gtk.ToggleButton(label="💬 Start Conversation")
+        self._conv_btn.add_css_class("suggested-action")
+        self._conv_btn.connect("toggled", self._on_conversation_toggled)
+        conv_box.append(self._conv_btn)
+
+        # ── Toggles row ──
+        toggle_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, homogeneous=True)
+        main_box.append(toggle_box)
+
+        self._tts_warm_btn = Gtk.ToggleButton(label="🔊 TTS Warm")
+        self._tts_warm_btn.connect("toggled", self._on_tts_warm_toggled)
+        toggle_box.append(self._tts_warm_btn)
+
+        self._privacy_btn = Gtk.ToggleButton(label="🔒 Privacy")
+        self._privacy_btn.add_css_class("destructive-action")
+        self._privacy_btn.connect("toggled", self._on_privacy_toggled)
+        toggle_box.append(self._privacy_btn)
+
+        # ── Info bar ──
+        self._info_label = Gtk.Label(label="Ready", wrap=True)
+        self._info_label.add_css_class("dim-label")
+        main_box.append(self._info_label)
+
+        # Wire push-to-talk gesture signals
+        self._setup_ptt_gesture(self._ptt_speech_btn, speech_reply=True)
+        self._setup_ptt_gesture(self._ptt_gui_btn, speech_reply=False)
+
+    def _set_indicator_color(self, color: str):
+        """Apply a background color to the status indicator."""
+        css_provider = Gtk.CssProvider()
+        css_provider.load_from_data(f".status-indicator {{ background: {color}; border-radius: 3px; min-height: 6px; }}".encode())
+        # Apply to the default display (GTK4 way)
+        display = self.get_display()
+        if display:
+            Gtk.StyleContext.add_provider_for_display(display, css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    # ── Push to Talk handlers ────────────────────────────────
+
+    def _setup_ptt_gesture(self, button: Gtk.Button, speech_reply: bool):
+        gesture = Gtk.GestureClick()
+        gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        gesture.connect("pressed", self._on_ptt_press, speech_reply)
+        gesture.connect("released", self._on_ptt_release, speech_reply)
+        button.add_controller(gesture)
+
+    def _on_ptt_press(self, gesture, n_press, x, y, speech_reply: bool):
+        """Start recording on button press."""
+        # Check privacy mode
+        if self._privacy_btn.props.active:
+            self._set_info("🔒 Privacy mode — recording blocked")
+            return
+
+        mode = "conversational" if speech_reply else "listen_only"
+        self._set_presence_mode(mode)
+        self._set_status("🔴 Recording…")
+        self._set_indicator_color(COLOR_RECORDING)
+        self._set_info(f"Recording ({'speech' if speech_reply else 'GUI'} reply)")
+
+        print(f"[widget] PTT press: speech_reply={speech_reply}", file=sys.stderr, flush=True)
+        self._start_ptt_recording(speech_reply)
+
+    def _on_ptt_release(self, gesture, n_press, x, y, speech_reply: bool):
+        """Stop recording and process on button release."""
+        print(f"[widget] PTT release: speech_reply={speech_reply}", file=sys.stderr, flush=True)
+        self._stop_ptt_recording(speech_reply)
+
+    def _start_ptt_recording(self, speech_reply: bool):
+        """Launch listen.py to record until we stop it."""
+        wav_path = VOICE_DIR / "tmp" / f"ptt-{time.strftime('%Y%m%d-%H%M%S')}.wav"
+        wav_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            str(PYTHON), str(VOICE_DIR / "listen.py"),
+            "--duration", str(PTT_MAX_DURATION),
+            "--stop-on-silence",
+            "--silence-seconds", str(PTT_SILENCE_SECONDS),
+            "--source", "POROSVOC",
+            "--no-transcribe",
+            "--ignore-presence",
+            "--wav-out", str(wav_path),
+        ]
+
+        print(f"[widget] Starting listen.py: {cmd}", file=sys.stderr, flush=True)
+        self._ptt_wav_path = wav_path
+        self._ptt_speech_reply = speech_reply
+        self._recording_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(WORKSPACE),
+        )
+        print(f"[widget] listen.py PID: {self._recording_proc.pid}", file=sys.stderr, flush=True)
+
+    def _stop_ptt_recording(self, speech_reply: bool):
+        """Stop recording, transcribe, and send via converse.py."""
+        proc = self._recording_proc
+        self._recording_proc = None
+
+        if proc is None or proc.poll() is not None:
+            self._set_status("Idle")
+            self._set_indicator_color(COLOR_IDLE)
+            return
+
+        # Send SIGINT to stop recording gracefully
+        # listen.py will convert .raw to .wav even on interrupt
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+        wav_path = self._ptt_wav_path
+        if wav_path is None or not wav_path.exists():
+            # Check if raw file exists but conversion failed
+            raw_path = wav_path.with_suffix(".raw") if wav_path else None
+            if raw_path and raw_path.exists():
+                # Attempt manual conversion
+                try:
+                    from listen import raw_to_wav
+                    raw_to_wav(raw_path, wav_path)
+                    raw_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if wav_path is None or not wav_path.exists():
+                self._set_status("Idle")
+                self._set_indicator_color(COLOR_IDLE)
+                self._set_info("No recording captured")
+                self._set_presence_mode("conversational")
+                return
+
+        self._set_status("🧠 Transcribing…")
+        self._set_indicator_color(COLOR_THINKING)
+
+        def _transcribe_and_send():
+            try:
+                cmd = [
+                    str(PYTHON), str(VOICE_DIR / "converse.py"),
+                    "--session-key", "agent:main:main",
+                    "--wav-in", str(wav_path),
+                    "--model", WHISPER_MODEL,
+                    "--backend", TTS_BACKEND if speech_reply else "piper",
+                ]
+                if not speech_reply:
+                    cmd.append("--no-play")
+
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True, text=True,
+                    cwd=str(WORKSPACE),
+                    timeout=120,
+                )
+                exit_code = result.returncode
+                if exit_code == 2:
+                    GLib.idle_add(self._set_info, "No speech detected")
+                elif exit_code != 0:
+                    stderr = (result.stderr or "").strip()
+                    GLib.idle_add(self._set_info, f"Error: {stderr[:120]}")
+                else:
+                    GLib.idle_add(self._set_info, "Turn complete")
+
+            except Exception as e:
+                GLib.idle_add(self._set_info, f"Error: {e}")
+            finally:
+                # Clean up temp WAV
+                if wav_path and wav_path.exists():
+                    try:
+                        wav_path.unlink()
+                    except OSError:
+                        pass
+                GLib.idle_add(self._set_status, "Idle")
+                GLib.idle_add(self._set_indicator_color, COLOR_IDLE)
+                self._set_presence_mode("conversational")
+
+        threading.Thread(target=_transcribe_and_send, daemon=True).start()
+
+    # ── Conversation mode ────────────────────────────────────
+
+    def _on_conversation_toggled(self, btn):
+        if btn.props.active:
+            # Privacy check
+            if self._privacy_btn.props.active:
+                self._set_info("🔒 Privacy mode — cannot start conversation")
+                btn.props.active = False
+                return
+            self._conv_active = True
+            self._conv_btn.set_label("💬 Stop Conversation")
+            self._set_status("💬 Conversation")
+            self._set_indicator_color(COLOR_RECORDING)
+            self._set_info("Starting conversation loop…")
+            self._start_conversation_loop()
+        else:
+            self._stop_conversation()
+
+    def _start_conversation_loop(self):
+        """Run converse.py in a loop, stopping after 1 consecutive silent turn."""
+        if not self._conv_active:
+            return
+
+        cmd = [
+            str(PYTHON), str(VOICE_DIR / "converse.py"),
+            "--session-key", "agent:main:main",
+            "--stop-on-silence",
+            "--silence-seconds", str(CONV_SILENCE_SECONDS),
+            "--duration", str(CONV_MAX_DURATION),
+            "--model", WHISPER_MODEL,
+        ]
+
+        def _run_turn():
+            try:
+                self._converse_proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    cwd=str(WORKSPACE),
+                )
+                stdout, stderr = self._converse_proc.communicate(timeout=180)
+                exit_code = self._converse_proc.returncode
+                self._converse_proc = None
+
+                if exit_code == 2:
+                    # Empty transcript — 1 silent turn, stop loop
+                    GLib.idle_add(self._set_info, "Silent turn — conversation paused")
+                    GLib.idle_add(self._end_conversation)
+                    return
+                elif exit_code == 130:
+                    # Keyboard interrupt — stop loop
+                    GLib.idle_add(self._end_conversation)
+                    return
+                elif exit_code != 0:
+                    stderr_text = (stderr or "").strip()
+                    GLib.idle_add(self._set_info, f"Turn error: {stderr_text[:100]}")
+                else:
+                    # Successful turn — reset idle timer
+                    self._conv_last_turn_time = time.time()
+
+                # Continue loop if still active
+                # Check idle timeout: if no successful turns for CONV_IDLE_TIMEOUT_S, stop
+                if self._conv_active:
+                    if time.time() - self._conv_last_turn_time > CONV_IDLE_TIMEOUT_S:
+                        GLib.idle_add(self._set_info, "Conversation idle — no speech for 3 min")
+                        GLib.idle_add(self._end_conversation)
+                        return
+                    GLib.idle_add(self._start_conversation_loop)
+
+            except subprocess.TimeoutExpired:
+                if self._converse_proc:
+                    self._converse_proc.terminate()
+                GLib.idle_add(self._set_info, "Turn timed out")
+                if self._conv_active:
+                    GLib.idle_add(self._start_conversation_loop)
+            except Exception as e:
+                GLib.idle_add(self._set_info, f"Error: {e}")
+                GLib.idle_add(self._end_conversation)
+
+        self._converse_thread = threading.Thread(target=_run_turn, daemon=True)
+        self._converse_thread.start()
+
+    def _end_conversation(self):
+        """Called from conversation loop when it stops itself (e.g. silent turn)."""
+        if not self._conv_active:
+            return
+        self._conv_active = False
+        self._conv_btn.props.active = False
+        self._conv_btn.set_label("💬 Start Conversation")
+        self._set_status("Idle")
+        self._set_indicator_color(COLOR_IDLE)
+        self._set_presence_mode("conversational")
+
+    def _stop_conversation(self):
+        """Called when user toggles conversation off."""
+        self._conv_active = False
+        if self._converse_proc and self._converse_proc.poll() is None:
+            self._converse_proc.send_signal(signal.SIGINT)
+        self._conv_btn.set_label("💬 Start Conversation")
+        self._set_status("Idle")
+        self._set_indicator_color(COLOR_IDLE)
+        self._set_info("Conversation ended")
+        self._set_presence_mode("conversational")
+
+    # ── TTS Warm toggle ──────────────────────────────────────
+
+    def _on_tts_warm_toggled(self, btn):
+        if btn.props.active:
+            self._set_info("Starting Kokoro TTS daemon…")
+            self._set_indicator_color(COLOR_WARMING)
+
+            def _start_daemon():
+                try:
+                    # Check if daemon is already running
+                    check = subprocess.run(
+                        [str(PYTHON), str(VOICE_DIR / "speak-daemon.py"), "--check"],
+                        capture_output=True, text=True, cwd=str(WORKSPACE), timeout=3,
+                    )
+                    if check.returncode == 0:
+                        self._tts_warmed = True
+                        GLib.idle_add(self._set_info, "Kokoro TTS daemon already running ✅")
+                        GLib.idle_add(self._set_indicator_color, COLOR_IDLE)
+                        return
+
+                    # Start daemon in background with Kokoro's venv Python
+                    kokoro_python = Path.home() / ".openclaw" / "tts" / "kokoro" / ".venv312" / "bin" / "python"
+                    daemon_cmd = [
+                        str(kokoro_python) if kokoro_python.exists() else str(PYTHON),
+                        str(VOICE_DIR / "speak-daemon.py"),
+                    ]
+                    subprocess.Popen(
+                        daemon_cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        cwd=str(WORKSPACE),
+                    )
+
+                    # Wait for daemon to become ready
+                    for _ in range(30):  # 30 x 0.5s = 15s max
+                        time.sleep(0.5)
+                        check = subprocess.run(
+                            [str(PYTHON), str(VOICE_DIR / "speak-daemon.py"), "--check"],
+                            capture_output=True, text=True, cwd=str(WORKSPACE), timeout=3,
+                        )
+                        if check.returncode == 0:
+                            self._tts_warmed = True
+                            GLib.idle_add(self._set_info, "Kokoro TTS daemon ready ✅")
+                            GLib.idle_add(self._set_indicator_color, COLOR_IDLE)
+                            return
+
+                    GLib.idle_add(self._set_info, "TTS daemon failed to start")
+                    GLib.idle_add(self._set_indicator_color, COLOR_IDLE)
+
+                except Exception as e:
+                    GLib.idle_add(self._set_info, f"TTS daemon error: {e}")
+                    GLib.idle_add(self._set_indicator_color, COLOR_IDLE)
+
+            threading.Thread(target=_start_daemon, daemon=True).start()
+        else:
+            # Request daemon shutdown
+            self._set_info("Stopping TTS daemon…")
+            try:
+                subprocess.run(
+                    [str(PYTHON), str(VOICE_DIR / "speak-daemon.py"), "--shutdown"],
+                    capture_output=True, text=True, cwd=str(WORKSPACE), timeout=5,
+                )
+            except Exception:
+                pass
+            self._tts_warmed = False
+            self._set_info("TTS daemon stopped")
+
+    # ── Privacy toggle ───────────────────────────────────────
+
+    def _on_privacy_toggled(self, btn):
+        if btn.props.active:
+            self._set_presence_mode("privacy")
+            self._set_status("🔒 Privacy")
+            self._set_indicator_color(COLOR_PRIVACY)
+            self._set_info("Mic off, speech off")
+            # Stop any active recording or conversation
+            if self._recording_proc and self._recording_proc.poll() is None:
+                self._recording_proc.terminate()
+                self._recording_proc = None
+            if self._conv_active:
+                self._conv_active = False
+                self._conv_btn.props.active = False
+                self._conv_btn.set_label("💬 Start Conversation")
+                if self._converse_proc and self._converse_proc.poll() is None:
+                    self._converse_proc.send_signal(signal.SIGINT)
+        else:
+            self._set_presence_mode("conversational")
+            self._set_status("Idle")
+            self._set_indicator_color(COLOR_IDLE)
+            self._set_info("Privacy off")
+
+    # ── Presence state helpers ────────────────────────────────
+
+    def _set_presence_mode(self, mode: str):
+        subprocess.Popen(
+            [str(PYTHON), str(VOICE_DIR / "presence.py"), "mode", mode],
+            cwd=str(WORKSPACE),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _set_status(self, text: str):
+        self._status_label.set_label(text)
+
+    def _set_info(self, text: str):
+        self._info_label.set_label(text)
+
+    def _start_polling(self):
+        """Poll presence-state.json for external state changes."""
+        self._poll_source_id = GLib.timeout_add(500, self._poll_state)
+
+    def _poll_state(self) -> bool:
+        """Called every 500ms to sync UI with presence state."""
+        try:
+            if STATE_PATH.exists():
+                state = json.loads(STATE_PATH.read_text())
+                activity = state.get("activity", "idle")
+                # Update status based on activity from converse.py
+                if activity == "listening" and not self._conv_active:
+                    # Only update if we're not already showing something
+                    pass
+                elif activity == "thinking":
+                    self._set_indicator_color(COLOR_THINKING)
+                elif activity == "speaking":
+                    self._set_indicator_color(COLOR_SPEAKING)
+                elif activity == "idle":
+                    if not self._conv_active and self._recording_proc is None:
+                        if not self._privacy_btn.props.active:
+                            self._set_indicator_color(COLOR_IDLE)
+        except Exception:
+            pass
+        return True  # Continue polling
+
+    def _stop_polling(self):
+        if self._poll_source_id is not None:
+            GLib.source_remove(self._poll_source_id)
+            self._poll_source_id = None
+
+
+def on_activate(app):
+    win = VoiceWidget(application=app)
+    win.present()
+
+
+def main():
+    app = Adw.Application(application_id=APP_ID)
+    app.connect("activate", on_activate)
+    app.run(None)
+
+
+if __name__ == "__main__":
+    main()

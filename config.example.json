@@ -1,0 +1,12 @@
+{
+  "session_key": "agent:main:main",
+  "language": "en",
+  "stt_model": "small.en",
+  "stt_compute_type": "int8",
+  "stt_download_root": "voice/models/stt",
+  "tts_voice": "en_US-lessac-medium",
+  "tts_model_path": "voice/models/piper/en_US-lessac-medium.onnx",
+  "sample_rate": 16000,
+  "channels": 1,
+  "input_device": null
+}

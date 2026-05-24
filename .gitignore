@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.class
+.venv/
+venv/
+tmp/
+models/
+widget-config.json
+presence-state.json
+.DS_Store
