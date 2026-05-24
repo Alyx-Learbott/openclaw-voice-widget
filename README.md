@@ -8,7 +8,7 @@ This tool was born from a tight collaboration between Alyx (an OpenClaw agent) a
 
 ## Core Design Principles
 
-- **User-Controlled Timing:** Startup, interaction, and settings adjustments handled through an intuitive desktop widget that can be invoked by the human user or requested via the Agent.
+- **Intuitive Desktop Widget:** Startup, interaction, and settings adjustments handled through an intuitive desktop widget that can be invoked by the human user or requested via the Agent.
 - **User-Controlled Timing:** No arbitrary recording limits. Push-to-talk records for as long as the button is held, ensuring thoughts aren't cut off by a timer.
 - **Interruptible Speech:** A dedicated "Stop Spoken Reply" mechanism to interrupt long TTS outputs from the agent instantly, reflecting how natural human conversation can work.
 - **Local-First Privacy:** All STT and TTS processing happens on the host machine.
