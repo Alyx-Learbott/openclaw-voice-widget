@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Alyx TTS daemon — keeps Kokoro model in memory for fast synthesis.
+"""Agent TTS daemon — keeps Kokoro model in memory for fast synthesis.
 
 Runs as a persistent process, listening on a Unix socket for synthesis requests.
 This eliminates the ~5s cold-start per invocation.
@@ -17,7 +17,7 @@ Protocol (line-delimited JSON):
 
 Usage:
   python3 voice/speak-daemon.py                    # Start daemon, blocks until quit
-  python3 voice/speak-daemon.py --socket-path /tmp/alyx-tts.sock  # Custom socket path
+  python3 voice/speak-daemon.py --socket-path /tmp/agent-tts.sock  # Custom socket path
   python3 voice/speak-daemon.py --check             # Check if daemon is running
   python3 voice/speak-daemon.py --shutdown           # Request running daemon to quit
 """
@@ -267,7 +267,7 @@ def run_daemon(socket_path: Path, idle_timeout: float = 300.0):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Alyx TTS daemon — keeps Kokoro model in memory")
+    parser = argparse.ArgumentParser(description="Agent TTS daemon — keeps Kokoro model in memory")
     parser.add_argument("--socket-path", default=str(DEFAULT_SOCKET_PATH), help="Unix socket path")
     parser.add_argument("--check", action="store_true", help="Check if daemon is running")
     parser.add_argument("--shutdown", action="store_true", help="Request running daemon to quit")
