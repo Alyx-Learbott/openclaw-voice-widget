@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-turn Alyx voice conversation runner.
+"""One-turn Agent voice conversation runner.
 
 Flow:
   presence conversational -> listen.py -> transcript -> OpenClaw chat.send
@@ -272,7 +272,7 @@ def send_transcript(session_key: str, transcript: str, timeout_seconds: float) -
 
 def speak_reply(text: str, backend: str, voice: str, speed: float, no_play: bool, max_chars: int) -> None:
     text = truncate_text(text, max_chars)
-    print(f"\nAlyx: {text}\n")
+    print(f"\nAgent: {text}\n")
     if no_play or not text:
         return
     cmd = [sys.executable, str(ROOT / "speak.py"), "--backend", backend]
