@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ubuntu-native speech-to-text helper for Alyx.
+"""Ubuntu-native speech-to-text helper for Agent.
 
 Records audio from POROSVOC mic, transcribes with faster-whisper, outputs text.
 
