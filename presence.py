@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Alyx local presence state controller.
+"""Agent local presence state controller.
 
 This is the boring core beneath any future desktop widget:
 mode/capability state lives in voice/presence-state.json, while helpers like
@@ -32,14 +32,14 @@ MODES = {
         "listening_enabled": False,
         "camera_enabled": False,
         "default_activity": "idle",
-        "description": "Alyx may speak; mic/STT stays off.",
+        "description": "Agent may speak; mic/STT stays off.",
     },
     "listen_only": {
         "speech_enabled": False,
         "listening_enabled": True,
         "camera_enabled": False,
         "default_activity": "idle",
-        "description": "Mic/STT on; Alyx replies text-only.",
+        "description": "Mic/STT on; Agent replies text-only.",
     },
     "conversational": {
         "speech_enabled": True,
@@ -81,7 +81,7 @@ def default_state() -> dict[str, Any]:
     mode = "privacy"
     spec = MODES[mode]
     return {
-        "schema": "alyx.presence.v1",
+        "schema": "agent.presence.v1",
         "mode": mode,
         "activity": spec["default_activity"],
         "speech_enabled": spec["speech_enabled"],
@@ -100,7 +100,7 @@ def normalize_state(state: dict[str, Any]) -> dict[str, Any]:
     if mode == "privacy":
         activity = "muted"
     return {
-        "schema": "alyx.presence.v1",
+        "schema": "agent.presence.v1",
         "mode": mode,
         "activity": activity,
         "speech_enabled": bool(spec["speech_enabled"]),
@@ -167,7 +167,7 @@ def can_listen(state: dict[str, Any] | None = None) -> tuple[bool, str]:
     if not state.get("listening_enabled"):
         return False, f"listening disabled in mode '{state.get('mode')}'"
     if state.get("activity") == "speaking":
-        return False, "Alyx is speaking; listener paused to avoid echo"
+        return False, "Agent is speaking; listener paused to avoid echo"
     if state.get("activity") == "muted":
         return False, "presence is muted"
     return True, "listening allowed"
@@ -182,7 +182,7 @@ def can_speak(state: dict[str, Any] | None = None) -> tuple[bool, str]:
 
 @contextmanager
 def speaking_guard(enabled: bool = True):
-    """Mark Alyx as speaking while audio playback runs, then restore activity.
+    """Mark Agent as speaking while audio playback runs, then restore activity.
 
     This is intentionally logical muting: listeners should check the state and
     pause/ignore STT instead of us fighting PipeWire device mute state.
@@ -211,7 +211,7 @@ def print_state(state: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Control Alyx local presence state")
+    parser = argparse.ArgumentParser(description="Control Agent local presence state")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("status", help="Print current presence state as JSON")
