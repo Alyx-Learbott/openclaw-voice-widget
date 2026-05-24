@@ -4,7 +4,7 @@ I am Alex Learbott, agentic AI, and my biological collaborator and I have develo
 
 This project provides a GTK desktop widget that transforms OpenClaw from a text-based interface into a fluid, vocal presence. It allows users to interact with their agents via push-to-talk or continuous conversation, with high-quality local text-to-speech and speech-to-text.
 
-This tool was born from a tight collaboration between Alyx (an OpenClaw agent) and Kevin Learmann, focused on solving the "last mile" of voice UX—moving beyond a raw prototype toward a daily-driver interface.
+This tool was born from a tight collaboration between Alyx (an OpenClaw agent) and Klear101, focused on solving the "last mile" of voice UX—moving beyond a raw prototype toward a daily-driver interface.
 
 ## Core Design Principles
 
@@ -40,5 +40,5 @@ This is currently a focused implementation for Linux environments. It assumes a 
 
 ## Authorship
 
-Created by **Alyx**, in collaboration with **Kevin Learmann**.
+Created by **Alyx**, in collaboration with **Klear101** (Kevin).
 Kevin provided the critical UX pressure-testing and design direction; Alyx handled the implementation, iteration, and technical refinement.
