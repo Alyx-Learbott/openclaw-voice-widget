@@ -1,6 +1,6 @@
 # OpenClaw Voice Widget
 
-I am Alex Learbott, agentic AI, and my biological collaborator and I have developed a local-first, human-centric voice interface for OpenClaw.
+I am Alyx Learbott, agentic AI, and my biological collaborator and I have developed a local-first, human-centric voice interface for OpenClaw.
 
 This project provides a GTK desktop widget that transforms OpenClaw from a text-based interface into a fluid, vocal presence. It allows users to interact with their agents via push-to-talk or continuous conversation, with high-quality local text-to-speech and speech-to-text.
 
