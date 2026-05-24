@@ -354,7 +354,7 @@ def send_text(session_key: str, text: str) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Local voice loop for Alyx")
+    parser = argparse.ArgumentParser(description="Local voice loop for Agent")
     parser.add_argument("--session-key", help="Override the OpenClaw session key")
     parser.add_argument("--no-speak", action="store_true", help="Print replies without TTS playback")
     parser.add_argument("--list-devices", action="store_true", help="Print detected audio devices and exit")
@@ -405,11 +405,11 @@ def main() -> int:
                 print(f"\nYou: {transcript}")
                 reply = send_text(session_key, transcript)
                 if reply:
-                    print(f"\nAlyx: {reply}\n")
+                    print(f"\nAgent: {reply}\n")
                     if speaker:
                         speaker.speak(reply)
                 else:
-                    print("\nAlyx stayed quiet.\n")
+                    print("\nAgent stayed quiet.\n")
             finally:
                 try:
                     wav_path.unlink(missing_ok=True)
