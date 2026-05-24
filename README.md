@@ -9,7 +9,7 @@ This tool was born from a tight collaboration between Alyx (an OpenClaw agent) a
 ## Core Design Principles
 
 - **User-Controlled Timing:** No arbitrary recording limits. Push-to-talk records for as long as the button is held, ensuring thoughts aren't cut off by a timer.
-- **Interruptible Speech:** A dedicated "Stop Spoken Reply" mechanism to kill long TTS outputs from the agent instantly, reflecting how natural human conversation works.
+- **Interruptible Speech:** A dedicated "Stop Spoken Reply" mechanism to interrupt long TTS outputs from the agent instantly, reflecting how natural human conversation works.
 - **Local-First Privacy:** All STT and TTS processing happens on the host machine.
 - **State Transparency:** Visual indicators (colors) provide immediate feedback on whether the agent is listening, thinking, or speaking.
 
